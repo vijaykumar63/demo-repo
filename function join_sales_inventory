@@ -1,0 +1,73 @@
+# filter inventory to keep dates that have either an OH inventory change or a sales event (for each sku-store)
+def join_sales_inventory(inv_raw_input, sales):
+    # 0.1. RD change - get rid of MD_TYPE test
+    inv_raw = inv_raw_input.groupby('SKU_SRCNUM', 'STORE_SRCNUM', 'EFF_DATE', 'EXP_DATE')\
+                           .agg(F.sum(F.col('EOP_UNITS_OH')).alias('EOP_UNITS_OH'),
+                                F.sum(F.col('INTRANSIT_UNITS')).alias('INTRANSIT_UNITS'))
+    
+    my_window = Window.partitionBy('SKU_SRCNUM','STORE_SRCNUM').orderBy('EFF_DATE')  
+    
+    # RD change 2023 0317 -> fill-in "gaps" with zero
+    gaps_fill = inv_raw.withColumn('date_gap', 
+                                   F.datediff(F.col('EFF_DATE'),
+                                              (F.lag('EXP_DATE',1).over(my_window)+1))) \
+                                                .filter(F.col('date_gap')>0).select('SKU_SRCNUM', 'STORE_SRCNUM', 'EFF_DATE','date_gap')\
+                                                .withColumnRenamed('EFF_DATE', 'EXP_DATE') \
+                                                .withColumn('EXP_DATE', F.col('EXP_DATE')-1) \
+                                                .withColumn('EFF_DATE', F.col('EXP_DATE')-F.col('date_gap')+1) \
+                                                .withColumn('EOP_UNITS_OH', F.lit(0)) \
+                                                .withColumn('INTRANSIT_UNITS', F.lit(0)) \
+                                                .drop('date_gap')
+    inv_raw = inv_raw.join(gaps_fill, 
+                           ['SKU_SRCNUM', 'STORE_SRCNUM', 'EFF_DATE', 'EXP_DATE', 'EOP_UNITS_OH', 'INTRANSIT_UNITS'],
+                           how = 'outer')
+    
+    
+    # 0.2. RD change - "merge" redundant inventory entries
+    inv_raw = inv_raw.withColumn('inv_change', (F.col('EOP_UNITS_OH') - F.lag(F.col('EOP_UNITS_OH'), 1).over(my_window)))
+    inv_raw = inv_raw.withColumn('date_delta' , F.datediff(F.col('EFF_DATE'), F.lag(F.col('EXP_DATE'), 1).over(my_window)))
+    inv_raw = inv_raw.withColumn('inv_change_flag' , F.when((F.col('inv_change') == 0), 0).otherwise(1))
+    inv_raw = inv_raw.withColumn('inv_change_flag_cumul' , F.sum(F.col('inv_change_flag')).over(my_window))
+    inv_raw = inv_raw.groupby('SKU_SRCNUM',
+                              'STORE_SRCNUM',
+                              'inv_change_flag_cumul')\
+                     .agg(F.min('EFF_DATE').alias('EFF_DATE'),
+                          F.max('EXP_DATE').alias('EXP_DATE'),
+                          F.max('EOP_UNITS_OH').alias('EOP_UNITS_OH'),
+                          F.max('INTRANSIT_UNITS').alias('INTRANSIT_UNITS'))
+    
+    # 1. first add flag to show if the inventory entry on a day changed the oh inventory
+    inv_step1 = inv_raw.withColumn('inv_change' , (F.col('EOP_UNITS_OH') - F.lag(F.col('EOP_UNITS_OH'), 1).over(my_window)))
+    inv_step1 = inv_step1.withColumn('inv_change_flag' , F.when(F.col('inv_change') == 0, 0).otherwise(1))
+    
+    # 2. locate first EFF_DATE per sku and store and filter sales based on that (i.e. keep sales info only after that)
+    # we do that assuming that the first inventory entry is correct and we start analyzing based on that
+    inv_sku_first_date = inv_raw.groupBy('SKU_SRCNUM','STORE_SRCNUM') \
+                                .agg(F.min('EFF_DATE').alias('min_EFF_DATE'))
+    sales_augm = sales.join(inv_sku_first_date, ['SKU_SRCNUM','STORE_SRCNUM'], how = 'inner')  # inner because we don't want sku-store combos that do                                                                                                                # not exist in the inventory data at all
+    sales_filt = sales_augm.filter(F.col('DATE_ID')>=F.col('min_EFF_DATE'))
+    
+    # RD Change 2023-03-17
+    sales_filt = sales_filt.groupby('SKU_SRCNUM', 'STORE_SRCNUM', 'DATE_ID') \
+                            .agg(F.sum('SLS_UNTS').alias('SLS_UNTS')).filter(F.col('SLS_UNTS') != 0)
+                                 
+    # 3. join filtered sales with inv_step1
+    sales_filt = sales_filt.withColumnRenamed('SKU_SRCNUM','SKU_SRCNUM_sales').withColumnRenamed('STORE_SRCNUM','STORE_SRCNUM_sales')
+    inv_step1 = inv_step1.join(sales_filt.select('SKU_SRCNUM_sales','STORE_SRCNUM_sales','DATE_ID','SLS_UNTS'), 
+                               (inv_step1.SKU_SRCNUM == sales_filt.SKU_SRCNUM_sales) &
+                               (inv_step1.STORE_SRCNUM == sales_filt.STORE_SRCNUM_sales) &
+                               (inv_step1.EFF_DATE == sales_filt.DATE_ID), how = 'outer')
+
+    # 5. merge columns to have full info in one column (but also keep the original ones)
+    inv_step1 = inv_step1.withColumn('DATE_FILL', F.coalesce(F.col('DATE_ID'), F.col('EFF_DATE')))
+    inv_step1 = inv_step1.withColumn('SKU_SRCNUM_FILL', F.coalesce(F.col('SKU_SRCNUM'), F.col('SKU_SRCNUM_sales')))
+    inv_step1 = inv_step1.withColumn('STORE_SRCNUM_FILL', F.coalesce(F.col('STORE_SRCNUM'), F.col('STORE_SRCNUM_sales')))
+    
+    return inv_step1
+
+
+def filter_inventory(inv_step1):
+    # 4. filter for records that either have a change in inventory or a sales event
+    inv_change = inv_step1.filter((F.col('inv_change_flag')==1) | (~F.col('DATE_ID').isNull()))
+    
+    return inv_change
