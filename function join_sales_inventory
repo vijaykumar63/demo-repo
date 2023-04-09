@@ -65,9 +65,3 @@ def join_sales_inventory(inv_raw_input, sales):
     
     return inv_step1
 
-
-def filter_inventory(inv_step1):
-    # 4. filter for records that either have a change in inventory or a sales event
-    inv_change = inv_step1.filter((F.col('inv_change_flag')==1) | (~F.col('DATE_ID').isNull()))
-    
-    return inv_change
