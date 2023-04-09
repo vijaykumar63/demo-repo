@@ -1,0 +1,50 @@
+def fill_exp_date_nulls_and_correct_oh(inv_change1):
+    w  = Window.partitionBy('SKU_SRCNUM_FILL','STORE_SRCNUM_FILL').orderBy('DATE_FILL')
+
+    inv_change2 = inv_change1.withColumn('is_eff_dt_null',
+                                         F.when(F.col('EFF_DATE').isNull(), 1).otherwise(0)) \
+                             .withColumn('prev_EFF_DATE', 
+                                         F.last(F.col('EFF_DATE'), ignorenulls = True) \
+                                         .over(w)) \
+                             .withColumn('prev_EXP_DATE',
+                                         F.last(F.col('EXP_DATE'),ignorenulls = True).over(w))\
+                             .withColumn('inside_prev_range',
+                                         F.when((F.col('DATE_ID')>F.col('prev_EFF_DATE')) & (F.col('DATE_ID')<F.col('prev_EXP_DATE')), 1) \
+                                         .otherwise(0)) \
+                             .withColumn('new_EFF_DATE',
+                                         F.when(F.col('is_eff_dt_null') == 1,
+                                                F.col('DATE_ID')) \
+                                         .otherwise(F.col('EFF_DATE'))) \
+                             .withColumn('new_EFF_DATE',
+                                         F.when((F.col('is_eff_dt_null') == 1) & (F.col('inside_prev_range') == 0),
+                                                F.col('DATE_ID')) \
+                                         .otherwise(F.col('new_EFF_DATE'))) \
+                             .withColumn('new_EXP_DATE',
+                                         F.when(F.lead(F.col('is_eff_dt_null'),1).over(w) == 1,
+                                                F.lead(F.col('new_EFF_DATE'),1).over(w) - 1) \
+                                         .otherwise(F.when(F.col('is_eff_dt_null') == 1, 
+                                                           F.last(F.col('EXP_DATE'), ignorenulls = True).over(w)) \
+                                                    .otherwise(F.col('EXP_DATE')))) \
+                            .withColumn('new_EXP_DATE', 
+                                        F.when((F.col('is_eff_dt_null')==1) & (F.col('inside_prev_range') == 0),
+                                               F.col('DATE_ID')) \
+                                        .otherwise(F.col('new_EXP_DATE'))) \
+                            .withColumn('EXP_DATE', F.col('new_EXP_DATE')) \
+                            .withColumn('EFF_DATE', F.col('new_EFF_DATE')) \
+                            .withColumn('EOP_UNITS_OH',
+                                        F.when(F.col('EOP_UNITS_OH').isNull(),
+                                               F.when(F.col('inside_prev_range') == 1,
+                                                      F.last(F.col('EOP_UNITS_OH'), 
+                                                             ignorenulls = True).over(w)) \
+                                               .otherwise(F.lit(0))) \
+                                        .otherwise(F.col('EOP_UNITS_OH'))) \
+                            .withColumn('INTRANSIT_UNITS',
+                                        F.when(F.col('INTRANSIT_UNITS').isNull(),
+                                               F.when(F.col('inside_prev_range') == 1,
+                                                      F.last(F.col('INTRANSIT_UNITS'), ignorenulls = True).over(w)) \
+                                               .otherwise(F.lit(0))) \
+                                        .otherwise(F.col('INTRANSIT_UNITS'))) \
+                            .withColumn('SKU_SRCNUM', F.col('SKU_SRCNUM_FILL')) \
+                            .withColumn('STORE_SRCNUM' ,F.col('STORE_SRCNUM_FILL'))
+            
+    return inv_change2
